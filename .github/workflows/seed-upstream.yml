@@ -22,9 +22,8 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch v8.5.0 https://github.com/GeiserX/Telegram-Archive.git upstream
-          rsync -a --exclude='.git' upstream/ ./
+          rsync -a --exclude='.git' --exclude='.github/workflows/' upstream/ ./
           rm -rf upstream
-          rm -f .github/workflows/seed-upstream.yml
 
       - name: Commit upstream source
         shell: bash
