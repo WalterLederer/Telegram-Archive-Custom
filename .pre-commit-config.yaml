@@ -1,0 +1,25 @@
+# Vendored viewer assets are byte-exact copies verified against a sha256
+# manifest (tests/test_vendored_assets.py) — any fixer that touches them
+# breaks the manifest, so every mutating hook excludes them.
+exclude: '^src/web/static/vendor/'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Keep in step with the ruff version in uv.lock, which is what CI runs.
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

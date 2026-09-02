@@ -1,0 +1,591 @@
+#!/bin/bash
+set -e
+
+# DB_TYPE is lowercased everywhere in Python (src/db/base.py, alembic/env.py)
+# but compared literally below — DB_TYPE=PostgreSQL used to match NEITHER
+# branch, silently skipping migrations and starting the app against a
+# zero-table database. Normalise once so both worlds agree.
+DB_TYPE=$(printf '%s' "${DB_TYPE:-}" | tr '[:upper:]' '[:lower:]')
+
+# Determine if we should run migrations
+# Skip migrations for 'auth' command (no database needed yet)
+# For other commands, check if database exists and run migrations if needed
+
+SKIP_MIGRATIONS=false
+if [[ "$1" == "python" ]] && [[ "$2" == "-m" ]] && [[ "$3" == "src" ]] && [[ "$4" == "auth" ]]; then
+    echo "Running auth command - skipping database migrations"
+    SKIP_MIGRATIONS=true
+fi
+
+# Run Alembic migrations if database exists
+if [ "$SKIP_MIGRATIONS" = "false" ]; then
+  if { [[ -n "$DATABASE_URL" ]] && { [[ "$DATABASE_URL" == postgresql://* ]] || [[ "$DATABASE_URL" == postgresql+asyncpg://* ]] || [[ "$DATABASE_URL" == postgres://* ]]; }; } || { [[ -z "$DATABASE_URL" ]] && { [ "$DB_TYPE" = "postgresql" ] || [ "$DB_TYPE" = "postgres" ]; }; }; then
+    echo "Running database migrations..."
+    python -c "
+from alembic.config import Config
+from alembic import command
+import os
+import sys
+import time
+import psycopg2
+from urllib.parse import unquote, urlparse
+
+# Build connection URL from the same DATABASE_URL-preferred contract the app uses.
+# urlparse does not decode percent-encoding, but RFC 3986 requires reserved
+# characters in credentials to be encoded - psycopg2 needs the decoded values.
+raw_url = os.getenv('DATABASE_URL', '')
+if raw_url:
+    normalized = raw_url.replace('postgresql+asyncpg://', 'postgresql://', 1).replace('postgres://', 'postgresql://', 1)
+    parsed = urlparse(normalized)
+    host = unquote(parsed.hostname or 'localhost')
+    port = str(parsed.port or 5432)
+    user = unquote(parsed.username or 'telegram')
+    password = unquote(parsed.password or '')
+    db = unquote((parsed.path or '/telegram_backup').lstrip('/'))
+else:
+    host = os.getenv('POSTGRES_HOST', 'localhost')
+    port = os.getenv('POSTGRES_PORT', '5432')
+    user = os.getenv('POSTGRES_USER', 'telegram')
+    password = os.getenv('POSTGRES_PASSWORD', '')
+    db = os.getenv('POSTGRES_DB', 'telegram_backup')
+
+print(f'Connecting to PostgreSQL at {host}:{port}...')
+
+# Retry logic - wait for PostgreSQL to be ready
+max_retries = 30
+retry_delay = 2
+conn = None
+
+for attempt in range(max_retries):
+    try:
+        conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=db)
+        print('PostgreSQL connection established.')
+        break
+    except psycopg2.OperationalError as e:
+        if attempt < max_retries - 1:
+            print(f'PostgreSQL not ready (attempt {attempt + 1}/{max_retries}), waiting {retry_delay}s...')
+            time.sleep(retry_delay)
+        else:
+            print(f'ERROR: Could not connect to PostgreSQL at {host}:{port} after {max_retries} attempts')
+            print(f'Error: {e}')
+            sys.exit(1)
+
+cur = conn.cursor()
+
+# Check if alembic_version table exists
+cur.execute(\"\"\"
+    SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_name = 'alembic_version'
+    );
+\"\"\")
+has_alembic = cur.fetchone()[0]
+
+# Check if chats table exists (pre-existing database)
+cur.execute(\"\"\"
+    SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_name = 'chats'
+    );
+\"\"\")
+has_tables = cur.fetchone()[0]
+
+if has_tables and not has_alembic:
+    print('Detected pre-Alembic database. Stamping with current version...')
+    # Create alembic_version table and stamp with latest version
+    cur.execute(\"\"\"
+        CREATE TABLE IF NOT EXISTS alembic_version (
+            version_num VARCHAR(32) NOT NULL,
+            CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+        );
+    \"\"\")
+    # Check artifact from migration 013: file_path values use negative chat_id folders
+    # Guard: media table may not exist on very old databases
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'media'
+        );
+    \"\"\")
+    has_media_table = cur.fetchone()[0]
+    has_013_paths = False
+    if has_media_table:
+        cur.execute(\"\"\"
+            SELECT EXISTS (
+                SELECT 1 FROM media
+                WHERE chat_id < 0 AND file_path LIKE '%/' || CAST(chat_id AS TEXT) || '/%'
+                LIMIT 1
+            );
+        \"\"\")
+        has_013_paths = cur.fetchone()[0]
+
+    # Check artifact from migration 015: message_versions table
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'message_versions'
+        );
+    \"\"\")
+    has_015_message_versions = cur.fetchone()[0]
+
+    # Check artifact from migration 016: media.download_attempts column
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'media' AND column_name = 'download_attempts'
+        );
+    \"\"\")
+    has_016_download_attempts = cur.fetchone()[0]
+
+    # Check artifact from migration 017: idx_messages_chat_id_id index
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM pg_indexes
+            WHERE tablename = 'messages' AND indexname = 'idx_messages_chat_id_id'
+        );
+    \"\"\")
+    has_017_chat_id_id_index = cur.fetchone()[0]
+
+    # Check artifacts from migration 018: reactions.removed_at column AND the
+    # chat-first index. Both must exist to stamp 018, or a partial schema would
+    # skip creating whichever the migration would otherwise add.
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'reactions' AND column_name = 'removed_at'
+        );
+    \"\"\")
+    has_018_removed_at_col = cur.fetchone()[0]
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM pg_indexes
+            WHERE tablename = 'reactions' AND indexname = 'idx_reactions_chat_message'
+        );
+    \"\"\")
+    has_018_reaction_removed_at = has_018_removed_at_col and cur.fetchone()[0]
+
+    # Check artifact from migration 020: messages.sender_name column. Migration
+    # 019 is data-only, so even schemas created from current ORM metadata must be
+    # stamped at 018 and run both 019 and guarded/idempotent 020.
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'messages' AND column_name = 'sender_name'
+        );
+    \"\"\")
+    has_020_sender_name = cur.fetchone()[0]
+
+    # Check artifact from migration 014: messages soft-delete marker columns
+    cur.execute(\"\"\"
+        SELECT
+            EXISTS (
+                SELECT FROM information_schema.columns
+                WHERE table_name = 'messages' AND column_name = 'is_deleted'
+            )
+            AND EXISTS (
+                SELECT FROM information_schema.columns
+                WHERE table_name = 'messages' AND column_name = 'deleted_at'
+            );
+    \"\"\")
+    has_014_soft_delete = cur.fetchone()[0]
+
+    # Check artifact from migration 012: idx_media_chat_type index
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM pg_indexes
+            WHERE indexname = 'idx_media_chat_type'
+        );
+    \"\"\")
+    has_012_index = cur.fetchone()[0]
+
+    # Check artifact from migration 011: media.content_hash column
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'media' AND column_name = 'content_hash'
+        );
+    \"\"\")
+    has_011_content_hash = cur.fetchone()[0]
+
+    # Check all artifacts from migration 010: viewer_tokens, app_settings, viewer_accounts.no_download
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'viewer_tokens'
+        );
+    \"\"\")
+    has_010_tokens = cur.fetchone()[0]
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'app_settings'
+        );
+    \"\"\")
+    has_010_settings = cur.fetchone()[0]
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'viewer_accounts' AND column_name = 'no_download'
+        );
+    \"\"\")
+    has_010_no_download = cur.fetchone()[0]
+    has_010_all = has_010_tokens and has_010_settings and has_010_no_download
+
+    # Check if viewer_sessions table exists (added in migration 009)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'viewer_sessions'
+        );
+    \"\"\")
+    has_009_table = cur.fetchone()[0]
+
+    # Check if push_subscriptions.username column exists (added in migration 008)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'push_subscriptions' AND column_name = 'username'
+        );
+    \"\"\")
+    has_008_column = cur.fetchone()[0]
+
+    # Check if viewer_accounts table exists (added in migration 007)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'viewer_accounts'
+        );
+    \"\"\")
+    has_007_table = cur.fetchone()[0]
+
+    # Check if forum_topics table exists (added in migration 006)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'forum_topics'
+        );
+    \"\"\")
+    has_006_table = cur.fetchone()[0]
+
+    # Check if idx_messages_reply_to index exists (added in migration 005)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM pg_indexes
+            WHERE indexname = 'idx_messages_reply_to'
+        );
+    \"\"\")
+    has_005_index = cur.fetchone()[0]
+
+    # Check if is_pinned column exists (added in migration 004)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'messages' AND column_name = 'is_pinned'
+        );
+    \"\"\")
+    has_is_pinned = cur.fetchone()[0]
+
+    # Check if push_subscriptions table exists (added in migration 003)
+    cur.execute(\"\"\"
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'push_subscriptions'
+        );
+    \"\"\")
+    has_push_subs = cur.fetchone()[0]
+
+    # Determine which version to stamp based on existing schema
+    # Migration 019 is a data-only cleanup with no detectable schema artifact.
+    # A schema with the 020 column was created from current ORM metadata, but it
+    # must still stamp at 018 so Alembic runs 019 before guarded/idempotent 020.
+    # 021 deliberately adds no rung either: its artifacts (NOT NULL, server
+    # defaults, the reactions FK) are exactly what an ORM-provisioned schema
+    # already has, so detecting them could only push the stamp past data-only
+    # 019. It reads the live schema per column and does nothing where the
+    # target shape is already in place, so re-running it here is a no-op.
+    # 022 adds no rung, for the same reason and by the same design. Its
+    # artifacts -- account_id in the keys, chats.ref, the accounts table -- are
+    # exactly what a schema built from current ORM metadata already carries, so
+    # a '022' rung could only skip data-only 019. 022 asks the live schema
+    # whether each key already has its account dimension and rebuilds only what
+    # does not, so an 8.0.0 create_all schema stamped here at 018 runs 019, then
+    # guarded 020 and 021, then 022 as a complete no-op. Verified in
+    # tests/test_migration_022.py against a create_all-provisioned 8.0.0 schema.
+    if has_018_reaction_removed_at and has_017_chat_id_id_index and has_016_download_attempts and has_015_message_versions and has_014_soft_delete:
+        stamp_version = '018'
+    elif has_017_chat_id_id_index and has_016_download_attempts and has_015_message_versions and has_014_soft_delete:
+        stamp_version = '017'
+    elif has_016_download_attempts and has_015_message_versions and has_014_soft_delete:
+        stamp_version = '016'
+    elif has_015_message_versions and has_014_soft_delete:
+        stamp_version = '015'
+    elif has_014_soft_delete:
+        stamp_version = '014'
+    elif has_013_paths:
+        stamp_version = '013'
+    elif has_012_index:
+        stamp_version = '012'
+    elif has_011_content_hash:
+        stamp_version = '011'
+    elif has_010_all:
+        stamp_version = '010'
+    elif has_009_table:
+        stamp_version = '009'
+    elif has_008_column:
+        stamp_version = '008'
+    elif has_007_table:
+        stamp_version = '007'
+    elif has_006_table:
+        stamp_version = '006'
+    elif has_005_index:
+        stamp_version = '005'
+    elif has_is_pinned:
+        stamp_version = '004'
+    elif has_push_subs:
+        stamp_version = '003'
+    else:
+        # Assume at least 002 (chat_date_index) - indexes are harder to check
+        stamp_version = '002'
+
+    cur.execute(f\"INSERT INTO alembic_version (version_num) VALUES ('{stamp_version}')\")
+    conn.commit()
+    print(f'Database stamped at version {stamp_version}')
+
+cur.close()
+conn.close()
+
+# Now run normal Alembic upgrade
+# alembic/env.py resolves the URL from the environment itself; setting
+# sqlalchemy.url here would only run it through configparser interpolation,
+# which rejects any raw or percent-encoded '%'.
+config = Config('/app/alembic.ini')
+command.upgrade(config, 'head')
+print('Migrations complete.')
+"
+  elif { [[ -n "$DATABASE_URL" ]] && { [[ "$DATABASE_URL" == sqlite://* ]] || [[ "$DATABASE_URL" == sqlite+aiosqlite://* ]]; }; } || { [[ -z "$DATABASE_URL" ]] && { [ "$DB_TYPE" = "sqlite" ] || [ -z "$DB_TYPE" ]; }; }; then
+    # SQLite - check if database file exists before running migrations
+    # Priority: DATABASE_PATH > DATABASE_DIR > DB_PATH > BACKUP_PATH/telegram_backup.db
+    _DB_FILE="${DATABASE_PATH:-${DATABASE_DIR:+${DATABASE_DIR}/telegram_backup.db}}"
+    _DB_FILE="${_DB_FILE:-${DB_PATH:-${BACKUP_PATH:-/data/backups}/telegram_backup.db}}"
+    # Resolve to absolute path (realpath -m works even if file doesn't exist yet)
+    DB_PATH="$(realpath -m "$_DB_FILE")"
+    if [[ "$DATABASE_URL" == sqlite+aiosqlite:///* ]]; then
+      DB_PATH="${DATABASE_URL#sqlite+aiosqlite:///}"
+    elif [[ "$DATABASE_URL" == sqlite:///* ]]; then
+      DB_PATH="${DATABASE_URL#sqlite:///}"
+    fi
+
+    # Alembic is the schema authority on both backends, so it runs whether or not
+    # the file exists yet. On a fresh install this creates the database at head
+    # with alembic_version already written, instead of leaving create_all() to
+    # build an unstamped schema whose revision the next start has to guess.
+    mkdir -p "$(dirname "$DB_PATH")"
+    if [ -f "$DB_PATH" ]; then
+      echo "SQLite database found at $DB_PATH - running migrations..."
+    else
+      echo "No SQLite database at $DB_PATH yet - creating it with Alembic..."
+    fi
+    python -c "
+from alembic.config import Config
+from alembic import command
+import os
+import sqlite3
+
+database_url = os.getenv('DATABASE_URL', '')
+if database_url.startswith('sqlite+aiosqlite:///'):
+    db_path = database_url.removeprefix('sqlite+aiosqlite:///')
+elif database_url.startswith('sqlite:///'):
+    db_path = database_url.removeprefix('sqlite:///')
+else:
+    # Same precedence as src/db/base.py and alembic/env.py. DATABASE_DIR was
+    # missing here, so a DATABASE_DIR-only install had its schema inspected at
+    # one path and migrated at another - the stamping ladder then read an empty
+    # database and skipped, and Alembic re-ran migration 001 against the real
+    # one. Keep these three resolution chains identical.
+    db_path = os.getenv('DATABASE_PATH', '')
+    if not db_path:
+        db_dir = os.getenv('DATABASE_DIR', '')
+        if db_dir:
+            db_path = os.path.join(db_dir, 'telegram_backup.db')
+    if not db_path:
+        db_path = os.getenv('DB_PATH', '')
+    if not db_path:
+        db_path = os.path.join(os.getenv('BACKUP_PATH', '/data/backups'), 'telegram_backup.db')
+    db_path = os.path.abspath(db_path)
+
+# Check if this is a pre-Alembic database that needs stamping
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+# Check if alembic_version table exists
+cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='alembic_version'\")
+has_alembic = cur.fetchone() is not None
+
+# Check if chats table exists (pre-existing database)
+cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='chats'\")
+has_tables = cur.fetchone() is not None
+
+if has_tables and not has_alembic:
+    print('Detected pre-Alembic SQLite database. Stamping with current version...')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS alembic_version (
+            version_num VARCHAR(32) NOT NULL,
+            CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+        )
+    ''')
+
+    # Check artifact from migration 013: file_path values use negative chat_id folders
+    # Guard: media table may not exist on very old databases
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='media'\")
+    has_media_table = cur.fetchone() is not None
+    has_013_paths = False
+    if has_media_table:
+        cur.execute(\"SELECT EXISTS(SELECT 1 FROM media WHERE chat_id < 0 AND file_path LIKE '%/' || CAST(chat_id AS TEXT) || '/%' LIMIT 1)\")
+        has_013_paths = cur.fetchone()[0]
+
+    # Check artifact from migration 015: message_versions table
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='message_versions'\")
+    has_015_message_versions = cur.fetchone() is not None
+
+    # Check artifact from migration 014: messages soft-delete marker columns
+    cur.execute(\"PRAGMA table_info(messages)\")
+    msg_columns = {row[1] for row in cur.fetchall()}
+    has_014_soft_delete = {'is_deleted', 'deleted_at'}.issubset(msg_columns)
+
+    # Check artifact from migration 012: idx_media_chat_type index
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_media_chat_type'\")
+    has_012_index = cur.fetchone() is not None
+
+    # Check artifact from migration 011: media.content_hash column
+    cur.execute(\"PRAGMA table_info(media)\")
+    media_columns = {row[1] for row in cur.fetchall()}
+    has_011_content_hash = 'content_hash' in media_columns
+    # Check artifact from migration 016: media.download_attempts column
+    has_016_download_attempts = 'download_attempts' in media_columns
+
+    # Check artifact from migration 017: idx_messages_chat_id_id index
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_chat_id_id'\")
+    has_017_chat_id_id_index = cur.fetchone() is not None
+
+    # Check artifacts from migration 018: reactions.removed_at column AND the
+    # chat-first index (both required to stamp 018, else a partial schema skips one).
+    cur.execute(\"PRAGMA table_info(reactions)\")
+    reaction_columns = {row[1] for row in cur.fetchall()}
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_reactions_chat_message'\")
+    has_018_reaction_removed_at = ('removed_at' in reaction_columns) and (cur.fetchone() is not None)
+
+    # Migration 020 is schema-only, but migration 019 before it is data-only and
+    # must still run for databases created from current ORM metadata.
+    has_020_sender_name = 'sender_name' in msg_columns
+
+    # Check all artifacts from migration 010: viewer_tokens, app_settings, viewer_accounts.no_download
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='viewer_tokens'\")
+    has_010_tokens = cur.fetchone() is not None
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='app_settings'\")
+    has_010_settings = cur.fetchone() is not None
+    cur.execute(\"PRAGMA table_info(viewer_accounts)\")
+    va_columns = {row[1] for row in cur.fetchall()}
+    has_010_no_download = 'no_download' in va_columns
+    has_010_all = has_010_tokens and has_010_settings and has_010_no_download
+
+    # Check if viewer_sessions table exists (added in migration 009)
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='viewer_sessions'\")
+    has_009_table = cur.fetchone() is not None
+
+    # Check if push_subscriptions.username column exists (added in migration 008)
+    cur.execute(\"PRAGMA table_info(push_subscriptions)\")
+    push_columns = {row[1] for row in cur.fetchall()}
+    has_008_column = 'username' in push_columns
+
+    # Check if viewer_accounts table exists (added in migration 007)
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='viewer_accounts'\")
+    has_007_table = cur.fetchone() is not None
+
+    # Check if forum_topics table exists (added in migration 006)
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='forum_topics'\")
+    has_006_table = cur.fetchone() is not None
+
+    # Check for idx_messages_reply_to index (added in migration 005)
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_reply_to'\")
+    has_005_index = cur.fetchone() is not None
+
+    # Check if is_pinned column exists (added in migration 004)
+    has_is_pinned = 'is_pinned' in msg_columns
+
+    # Check if push_subscriptions table exists (added in migration 003)
+    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='push_subscriptions'\")
+    has_push_subs = cur.fetchone() is not None
+
+    # Determine which version to stamp based on existing schema
+    # Even when the 020 artifact exists, cap the stamp at 018 so migration 019
+    # runs before guarded/idempotent migration 020.
+    # 021 adds no rung for the same reason: its artifacts (NOT NULL, server
+    # defaults, the reactions FK) are what an ORM-provisioned schema already
+    # has, so detecting them could only push the stamp past data-only 019. It
+    # inspects the live schema per column and rebuilds only the tables that
+    # still differ, so re-running it against such a database does nothing.
+    # 022 adds no rung, for the same reason and by the same design. Its
+    # artifacts -- account_id in the keys, chats.ref, the accounts table -- are
+    # exactly what a schema built from current ORM metadata already carries, so
+    # a '022' rung could only skip data-only 019. 022 asks the live schema
+    # whether each key already has its account dimension and rebuilds only what
+    # does not, so an 8.0.0 create_all schema stamped here at 018 runs 019, then
+    # guarded 020 and 021, then 022 as a complete no-op. Verified in
+    # tests/test_migration_022.py against a create_all-provisioned 8.0.0 schema.
+    if has_018_reaction_removed_at and has_017_chat_id_id_index and has_016_download_attempts and has_015_message_versions and has_014_soft_delete:
+        stamp_version = '018'
+    elif has_017_chat_id_id_index and has_016_download_attempts and has_015_message_versions and has_014_soft_delete:
+        stamp_version = '017'
+    elif has_016_download_attempts and has_015_message_versions and has_014_soft_delete:
+        stamp_version = '016'
+    elif has_015_message_versions and has_014_soft_delete:
+        stamp_version = '015'
+    elif has_014_soft_delete:
+        stamp_version = '014'
+    elif has_013_paths:
+        stamp_version = '013'
+    elif has_012_index:
+        stamp_version = '012'
+    elif has_011_content_hash:
+        stamp_version = '011'
+    elif has_010_all:
+        stamp_version = '010'
+    elif has_009_table:
+        stamp_version = '009'
+    elif has_008_column:
+        stamp_version = '008'
+    elif has_007_table:
+        stamp_version = '007'
+    elif has_006_table:
+        stamp_version = '006'
+    elif has_005_index:
+        stamp_version = '005'
+    elif has_is_pinned:
+        stamp_version = '004'
+    elif has_push_subs:
+        stamp_version = '003'
+    else:
+        stamp_version = '002'
+
+    cur.execute(f\"INSERT INTO alembic_version (version_num) VALUES ('{stamp_version}')\")
+    conn.commit()
+    print(f'Database stamped at version {stamp_version}')
+
+cur.close()
+conn.close()
+
+# Now run normal Alembic upgrade
+# alembic/env.py resolves the URL from the environment itself (see above).
+config = Config('/app/alembic.ini')
+command.upgrade(config, 'head')
+print('SQLite migrations complete.')
+"
+  else
+    echo "ERROR: unrecognised database configuration (DB_TYPE='${DB_TYPE}', DATABASE_URL scheme unsupported)." >&2
+    echo "ERROR: refusing to start with migrations skipped - the app would face a schema Alembic never built." >&2
+    exit 1
+  fi
+fi
+
+# Execute the main command
+exec "$@"

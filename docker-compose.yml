@@ -1,0 +1,343 @@
+services:
+  telegram-backup:
+    image: drumsergio/telegram-archive:8.5.0
+    container_name: telegram-backup
+    restart: unless-stopped
+    # A stop during a long sweep needs time to finish in-flight writes and
+    # disconnect cleanly; without this docker waits 10s then SIGKILLs.
+    stop_grace_period: 90s
+    # Unattended deployments must not fill the host disk with container logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["python", "-m", "src", "schedule"]
+
+    # Every variable documented in .env.example reaches the container. The
+    # environment: block below interpolates ${VAR} references for readable
+    # defaults, but compose injects nothing from .env into a container by
+    # itself — without this, a documented variable missing from that block
+    # (FILL_GAPS, PARALLEL_DOWNLOAD_*, LISTEN_* sub-toggles, …) was silently
+    # inert. Explicit environment: entries below still win on conflict.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # Telegram Credentials (required)
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_PHONE: ${TELEGRAM_PHONE}
+      SESSION_NAME: ${SESSION_NAME:-telegram_backup}
+      TELEGRAM_PROXY_TYPE: ${TELEGRAM_PROXY_TYPE:-}
+      TELEGRAM_PROXY_ADDR: ${TELEGRAM_PROXY_ADDR:-}
+      TELEGRAM_PROXY_PORT: ${TELEGRAM_PROXY_PORT:-}
+      TELEGRAM_PROXY_USERNAME: ${TELEGRAM_PROXY_USERNAME:-}
+      TELEGRAM_PROXY_PASSWORD: ${TELEGRAM_PROXY_PASSWORD:-}
+      TELEGRAM_PROXY_RDNS: ${TELEGRAM_PROXY_RDNS:-}
+
+      # Multiple accounts (v8.0.0+): archive several Telegram accounts into the
+      # same database and media store. Indexes start at 1 and are contiguous;
+      # declaring any TG_ACCOUNT_* variable makes the indexed set win over the
+      # legacy credentials above. See README → Multiple Accounts.
+      # TG_ACCOUNT_1_API_ID: ${TG_ACCOUNT_1_API_ID:-}
+      # TG_ACCOUNT_1_API_HASH: ${TG_ACCOUNT_1_API_HASH:-}
+      # TG_ACCOUNT_1_PHONE_NUMBER: ${TG_ACCOUNT_1_PHONE_NUMBER:-}
+      # TG_ACCOUNT_1_LABEL: ${TG_ACCOUNT_1_LABEL:-}
+      # TG_ACCOUNT_2_API_ID: ${TG_ACCOUNT_2_API_ID:-}
+      # TG_ACCOUNT_2_API_HASH: ${TG_ACCOUNT_2_API_HASH:-}
+      # TG_ACCOUNT_2_PHONE_NUMBER: ${TG_ACCOUNT_2_PHONE_NUMBER:-}
+      # TG_ACCOUNT_2_LABEL: ${TG_ACCOUNT_2_LABEL:-}
+      # TG_ACCOUNT_2_SESSION_NAME: ${TG_ACCOUNT_2_SESSION_NAME:-telegram_backup_account2}
+
+      # Schedule (cron format)
+      SCHEDULE: ${SCHEDULE:-0 */6 * * *}
+
+      # Backup Configuration
+      BACKUP_PATH: /data/backups
+      DOWNLOAD_MEDIA: ${DOWNLOAD_MEDIA:-true}
+      MAX_MEDIA_SIZE_MB: ${MAX_MEDIA_SIZE_MB:-100}
+      # Absorb mid-download FloodWaits up to N seconds so large files resume
+      # in place instead of restarting from byte 0 (issue #232). 0 disables.
+      # MEDIA_FLOOD_SLEEP_THRESHOLD: ${MEDIA_FLOOD_SLEEP_THRESHOLD:-60}
+      # Absorb FloodWaits up to N seconds during get_dialogs()'s internal
+      # pagination so it resumes on the same page instead of the whole call
+      # restarting from page 1 (issue #295). 0 disables.
+      # DIALOG_FLOOD_SLEEP_THRESHOLD: ${DIALOG_FLOOD_SLEEP_THRESHOLD:-60}
+      BATCH_SIZE: ${BATCH_SIZE:-100}
+      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-1}
+      # DEDUPLICATE_MEDIA: ${DEDUPLICATE_MEDIA:-true}
+      # PRIORITY_CHAT_IDS: ${PRIORITY_CHAT_IDS:-}
+      # SKIP_MEDIA_CHAT_IDS: ${SKIP_MEDIA_CHAT_IDS:-}
+      # SKIP_MEDIA_DELETE_EXISTING: ${SKIP_MEDIA_DELETE_EXISTING:-true}
+      SKIP_TOPIC_IDS: ${SKIP_TOPIC_IDS:-}
+      # STATS_CALCULATION_HOUR: ${STATS_CALCULATION_HOUR:-3}
+
+      # =======================================================================
+      # CHAT FILTERING - Choose ONE mode:
+      # =======================================================================
+      # MODE 1 (Simple): Set CHAT_IDS to backup ONLY specific chats
+      #   CHAT_IDS: "-100123456,-100789012"  # Only these chats, nothing else
+      #
+      # MODE 2 (Default): Use CHAT_TYPES to backup by type
+      #   CHAT_TYPES: "private,groups,channels"  # All chats of these types
+      # =======================================================================
+      CHAT_IDS: ${CHAT_IDS:-}
+      # If a CHAT_IDS entry can't be resolved (typically a DM on a fresh
+      # session), scan up to N dialogs once to warm the entity cache (#234).
+      # WHITELIST_RESOLVE_DIALOG_LIMIT: ${WHITELIST_RESOLVE_DIALOG_LIMIT:-1000}
+      CHAT_TYPES: ${CHAT_TYPES:-private,groups,channels}
+
+      # Granular Filtering (only used in type-based mode)
+      GLOBAL_INCLUDE_CHAT_IDS: ${GLOBAL_INCLUDE_CHAT_IDS:-}
+      GLOBAL_EXCLUDE_CHAT_IDS: ${GLOBAL_EXCLUDE_CHAT_IDS:-}
+      PRIVATE_INCLUDE_CHAT_IDS: ${PRIVATE_INCLUDE_CHAT_IDS:-}
+      PRIVATE_EXCLUDE_CHAT_IDS: ${PRIVATE_EXCLUDE_CHAT_IDS:-}
+      GROUPS_INCLUDE_CHAT_IDS: ${GROUPS_INCLUDE_CHAT_IDS:-}
+      GROUPS_EXCLUDE_CHAT_IDS: ${GROUPS_EXCLUDE_CHAT_IDS:-}
+      CHANNELS_INCLUDE_CHAT_IDS: ${CHANNELS_INCLUDE_CHAT_IDS:-}
+      CHANNELS_EXCLUDE_CHAT_IDS: ${CHANNELS_EXCLUDE_CHAT_IDS:-}
+      # Adopt the new supergroup id when a tracked basic group migrates (#228).
+      # Default false = warn only; true = follow + capture automatically.
+      # FOLLOW_CHAT_MIGRATIONS: ${FOLLOW_CHAT_MIGRATIONS:-false}
+
+      # Database Configuration (v3.0+)
+      # Option 1: DATABASE_URL (takes priority)
+      DATABASE_URL: ${DATABASE_URL:-}
+      # Option 2: Individual settings
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_PATH: ${DB_PATH:-/data/backups/telegram_backup.db}
+      # PostgreSQL settings (when DB_TYPE=postgresql or using DATABASE_URL)
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-telegram}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-telegram_backup}
+
+      # Real-time Listener
+      # ENABLE_LISTENER is the master switch — when false, all LISTEN_* vars are ignored
+      ENABLE_LISTENER: ${ENABLE_LISTENER:-false}
+      # Granular listener controls (only apply when ENABLE_LISTENER=true):
+      # LISTEN_EDITS: ${LISTEN_EDITS:-true}
+      # LISTEN_DELETIONS: ${LISTEN_DELETIONS:-false}
+      DELETION_MODE: ${DELETION_MODE:-hard}
+      # LISTEN_NEW_MESSAGES: ${LISTEN_NEW_MESSAGES:-true}
+      # LISTEN_NEW_MESSAGES_MEDIA: ${LISTEN_NEW_MESSAGES_MEDIA:-false}
+      # LISTEN_CHAT_ACTIONS: ${LISTEN_CHAT_ACTIONS:-true}
+      # LISTEN_REACTIONS: ${LISTEN_REACTIONS:-false}
+      # REACTION_DEBOUNCE_SECONDS: ${REACTION_DEBOUNCE_SECONDS:-1.5}
+      # REACTION_RESWEEP_DAYS: ${REACTION_RESWEEP_DAYS:-0}
+      # REACTION_RESWEEP_MAX_PER_CHAT: ${REACTION_RESWEEP_MAX_PER_CHAT:-500}
+      # REACTION_RESWEEP_BATCH_DELAY_SECONDS: ${REACTION_RESWEEP_BATCH_DELAY_SECONDS:-2}
+
+      # Mass operation protection (only applies when ENABLE_LISTENER=true)
+      # MASS_OPERATION_THRESHOLD: ${MASS_OPERATION_THRESHOLD:-10}
+      # MASS_OPERATION_WINDOW_SECONDS: ${MASS_OPERATION_WINDOW_SECONDS:-30}
+      # MASS_OPERATION_BUFFER_DELAY: ${MASS_OPERATION_BUFFER_DELAY:-2.0}
+
+      # Outbound event webhook (#336) — requires ENABLE_LISTENER=true
+      EVENT_WEBHOOK_ENABLED: ${EVENT_WEBHOOK_ENABLED:-false}
+      # EVENT_WEBHOOK_URL: ${EVENT_WEBHOOK_URL:-}
+      # EVENT_WEBHOOK_METHOD: ${EVENT_WEBHOOK_METHOD:-POST}
+      # EVENT_WEBHOOK_HEADERS: ${EVENT_WEBHOOK_HEADERS:-}
+      # EVENT_WEBHOOK_EVENTS: ${EVENT_WEBHOOK_EVENTS:-message_edited,message_deleted}
+      # EVENT_WEBHOOK_CHAT_IDS: ${EVENT_WEBHOOK_CHAT_IDS:-}
+      # EVENT_WEBHOOK_BODY_TEMPLATE: ${EVENT_WEBHOOK_BODY_TEMPLATE:-}
+
+      # Batch sync alternative (expensive — prefer ENABLE_LISTENER instead)
+      SYNC_DELETIONS_EDITS: ${SYNC_DELETIONS_EDITS:-false}
+      VERIFY_MEDIA: ${VERIFY_MEDIA:-false}
+      INTERNAL_PUSH_SECRET: ${INTERNAL_PUSH_SECRET:-}
+      # Split containers: realtime pushes must target the viewer SERVICE, not
+      # the in-container localhost the bare-metal default assumes — otherwise
+      # every push is refused and "real-time updates" silently degrades to
+      # refresh-to-see on the stock SQLite stack.
+      VIEWER_HOST: ${VIEWER_HOST:-telegram-viewer}
+      VIEWER_PORT: ${VIEWER_PORT:-8000}
+
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    volumes:
+      # Persistent data storage
+      - ./data:/data
+    networks:
+      - telegram-network
+    # Security hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Uncomment to use PostgreSQL
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+    # Optional: Resource limits
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1.0'
+    #       memory: 1G
+    #     reservations:
+    #       cpus: '0.5'
+    #       memory: 512M
+
+  telegram-viewer:
+    image: drumsergio/telegram-archive-viewer:8.5.0
+    container_name: telegram-viewer
+    restart: unless-stopped
+    # A stop during a long sweep needs time to finish in-flight writes and
+    # disconnect cleanly; without this docker waits 10s then SIGKILLs.
+    stop_grace_period: 90s
+    # Unattended deployments must not fill the host disk with container logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      # Bind to localhost by default. Put this behind a reverse proxy with auth
+      # configured before exposing it publicly.
+      - "127.0.0.1:8000:8000"
+
+    # DELIBERATE ASYMMETRY with telegram-backup: no env_file here. This is the
+    # internet-facing container, so it receives an explicit allowlist instead
+    # of the whole .env — capture credentials (TELEGRAM_API_HASH, proxy
+    # passwords) must never enter its environment. Every viewer-documented
+    # variable therefore needs an entry below; the ${VAR:-default} references
+    # are interpolated from the same .env.
+
+    environment:
+      BACKUP_PATH: /data/backups
+
+      # Authentication is required by default. To deliberately run a local
+      # anonymous viewer, set ALLOW_ANONYMOUS_VIEWER=true.
+      VIEWER_USERNAME: ${VIEWER_USERNAME:-}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:-}
+      ALLOW_ANONYMOUS_VIEWER: ${ALLOW_ANONYMOUS_VIEWER:-false}
+      AUTH_SESSION_DAYS: ${AUTH_SESSION_DAYS:-30}
+
+      # Display
+      VIEWER_TIMEZONE: ${VIEWER_TIMEZONE:-Europe/Madrid}
+      # Default color theme for browsers with no saved choice
+      # (slate | night | amoled | forest | aubergine | day | paper); the in-app picker wins.
+      VIEWER_DEFAULT_THEME: ${VIEWER_DEFAULT_THEME:-}
+      SHOW_STATS: ${SHOW_STATS:-true}
+      # Restrict viewer to specific chats (optional)
+      DISPLAY_CHAT_IDS: ${DISPLAY_CHAT_IDS:-}
+
+      # Security
+      # CORS_ORIGINS: comma-separated allowed origins (default: * = allow all)
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      # SECURE_COOKIES: auto-detect from protocol; override with true/false
+      SECURE_COOKIES: ${SECURE_COOKIES:-}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      INTERNAL_PUSH_SECRET: ${INTERNAL_PUSH_SECRET:-}
+      # Reverse-proxy (Authelia/Authentik) identity integration
+      AUTH_PROXY_HEADER: ${AUTH_PROXY_HEADER:-}
+      AUTH_PROXY_ADMIN_USERS: ${AUTH_PROXY_ADMIN_USERS:-}
+      AUTH_PROXY_DEFAULT_ACCESS: ${AUTH_PROXY_DEFAULT_ACCESS:-none}
+
+      # Notifications
+      PUSH_NOTIFICATIONS: ${PUSH_NOTIFICATIONS:-basic}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_CONTACT: ${VAPID_CONTACT:-mailto:admin@example.com}
+
+      # Database Configuration — MUST MATCH telegram-backup service!
+      # If viewer shows no data, ensure these match the backup container
+      DATABASE_URL: ${DATABASE_URL:-}
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_PATH: ${DB_PATH:-/data/backups/telegram_backup.db}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-telegram}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-telegram_backup}
+
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    volumes:
+      # SQLite needs write access for WAL journal files (.db-wal, .db-shm).
+      # Use :ro only if you are using PostgreSQL as the database backend.
+      - ./data:/data
+    networks:
+      - telegram-network
+    # Security hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # There is deliberately no ordering between this service and
+    # telegram-backup, and none is needed. telegram-backup owns the schema and
+    # migrates it on start; this image ships no alembic/ and cannot. It also no
+    # longer writes tables into a database that already has any (see
+    # _create_schema_if_absent in src/db/base.py), so starting it never
+    # corrupts a migration. The ordering that matters is enforced from the
+    # other side: a migration that rebuilds tables refuses to start while any
+    # other process holds the SQLite file, and proceeds once it is released.
+    # Do not add depends_on here expecting it to wait for migrations:
+    # depends_on waits for the container, not for the work it does, so it
+    # would only look like a guarantee.
+    # Uncomment to use PostgreSQL
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+
+  # Example: Restricted Channel Viewer (optional)
+  # Use this to share specific channels publicly with authentication
+  # telegram-channel-viewer:
+  #   image: drumsergio/telegram-archive-viewer:8.5.0
+  #   container_name: telegram-channel-viewer
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8001:8000"
+  #   environment:
+  #     BACKUP_PATH: /data/backups
+  #     DISPLAY_CHAT_IDS: 224091347,123456789  # Comma-separated chat IDs
+  #     VIEWER_USERNAME: public_viewer
+  #     VIEWER_PASSWORD: secure_password_here
+  #   volumes:
+  #     - ./data:/data
+  #   networks:
+  #     - telegram-network
+
+  # ================================
+  # PostgreSQL Database (Optional)
+  # ================================
+  # Uncomment to use PostgreSQL instead of SQLite
+  # Also set DB_TYPE=postgresql in your .env file
+  #
+  # postgres:
+  #   image: postgres:18-alpine
+  #   container_name: telegram-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER:-telegram}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  #     POSTGRES_DB: ${POSTGRES_DB:-telegram_backup}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql
+  #   networks:
+  #     - telegram-network
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telegram} -d ${POSTGRES_DB:-telegram_backup}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+networks:
+  telegram-network:
+    driver: bridge
+
+# Uncomment for PostgreSQL persistent storage
+# volumes:
+#   postgres_data:

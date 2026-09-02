@@ -1,0 +1,1242 @@
+"""
+Import Telegram Desktop chat exports into Telegram-Archive.
+
+Supports two export formats:
+- JSON format: result.json from Telegram Desktop "Export Telegram data" (full account export)
+- HTML format: messages.html from Telegram Desktop per-chat export (single chat)
+
+Both formats insert messages, users, and media into the existing database schema.
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import re
+import shutil
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import ijson
+
+from .db import DatabaseAdapter, close_database, get_adapter, init_database
+from .db.models import DEFAULT_ACCOUNT_ID, account_metadata_key
+from .message_utils import build_media_filename, utcnow_naive
+
+logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 500
+
+CHAT_TYPE_MAP = {
+    "personal_chat": "private",
+    "bot_chat": "private",
+    "saved_messages": "private",
+    "private_group": "group",
+    "private_supergroup": "supergroup",
+    "public_supergroup": "supergroup",
+    "private_channel": "channel",
+    "public_channel": "channel",
+}
+
+MEDIA_TYPE_MAP = {
+    "animation": "animation",
+    "video_file": "video",
+    "video_message": "video_note",
+    "voice_message": "voice",
+    "audio_file": "audio",
+    "sticker": "sticker",
+}
+
+# Maps HTML media CSS classes to media_type values used by MEDIA_TYPE_MAP
+HTML_CSS_MEDIA_TYPE = {
+    "media_photo": "photo",
+    "media_video": "video_file",
+    "media_voice_message": "voice_message",
+    "media_audio_file": "audio_file",
+    "media_video_message": "video_message",
+    "media_animation": "animation",
+    "media_sticker": "sticker",
+    "media_file": "",
+    "media_document": "",
+}
+
+# Maps HTML export folder names to media_type values
+HTML_FOLDER_MEDIA_TYPE = {
+    "photos": "photo",
+    "video_files": "video_file",
+    "voice_messages": "voice_message",
+    "round_video_messages": "video_message",
+    "stickers": "sticker",
+    "files": "",
+    "images": "photo",
+}
+
+
+def parse_from_id(from_id: str | None) -> int | None:
+    """Parse Telegram Desktop's from_id string into a numeric ID.
+
+    Formats: "user123456789", "channel123456789", "group123456789"
+    """
+    if not isinstance(from_id, str) or not from_id:
+        return None
+    for prefix, multiplier in (("user", 1), ("channel", -1), ("group", -1)):
+        if from_id.startswith(prefix):
+            try:
+                raw = int(from_id[len(prefix) :])
+                if prefix == "channel":
+                    return -(1000000000000 + raw)
+                return raw * multiplier
+            except ValueError:
+                return None
+    return None
+
+
+def _clean_sender_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def derive_chat_id(export_id: int, export_type: str) -> int:
+    """Derive a marked chat ID from the export's raw id and type."""
+    if export_type in ("personal_chat", "bot_chat", "saved_messages"):
+        return export_id
+    if export_type == "private_group":
+        return -export_id
+    if export_type in ("private_supergroup", "public_supergroup", "private_channel", "public_channel"):
+        return -(1000000000000 + export_id)
+    return export_id
+
+
+def flatten_text(text_field: str | list | None) -> str:
+    """Flatten Telegram Desktop's text field to plain string.
+
+    The field can be a plain string or an array of text entity objects
+    like [{"type": "plain", "text": "Hello "}, {"type": "bold", "text": "world"}].
+    """
+    if text_field is None:
+        return ""
+    if isinstance(text_field, str):
+        return text_field
+    if isinstance(text_field, list):
+        parts = []
+        for item in text_field:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("text", ""))
+        return "".join(parts)
+    return str(text_field)
+
+
+def parse_date(msg: dict) -> datetime | None:
+    """Parse date from a Telegram Desktop export message."""
+    if "date_unixtime" in msg:
+        try:
+            return datetime.fromtimestamp(int(msg["date_unixtime"]), tz=UTC).replace(tzinfo=None)
+        except ValueError, TypeError, OSError:
+            pass
+    if "date" in msg:
+        try:
+            parsed = datetime.fromisoformat(msg["date"])
+        except ValueError, TypeError:
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(UTC).replace(tzinfo=None)
+        return parsed
+    return None
+
+
+def parse_edited_date(msg: dict) -> datetime | None:
+    """Parse edit date from a Telegram Desktop export message."""
+    if "edited_unixtime" in msg:
+        try:
+            return datetime.fromtimestamp(int(msg["edited_unixtime"]), tz=UTC).replace(tzinfo=None)
+        except ValueError, TypeError, OSError:
+            pass
+    if "edited" in msg:
+        try:
+            parsed = datetime.fromisoformat(msg["edited"])
+        except ValueError, TypeError:
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(UTC).replace(tzinfo=None)
+        return parsed
+    return None
+
+
+def _detect_media(msg: dict) -> tuple[str | None, str | None, str | None]:
+    """Detect media type and file path from an export message.
+
+    Returns (media_type, relative_path, original_filename).
+    """
+    if isinstance(msg.get("photo"), str) and msg["photo"]:
+        rel = msg["photo"]
+        return "photo", rel, Path(rel).name
+
+    if isinstance(msg.get("file"), str) and msg["file"]:
+        rel = msg["file"]
+        supplied_name = msg.get("file_name")
+        fname = supplied_name if isinstance(supplied_name, str) and supplied_name else Path(rel).name
+        supplied_type = msg.get("media_type", "")
+        media_type = MEDIA_TYPE_MAP.get(supplied_type, "document") if isinstance(supplied_type, str) else "document"
+        return media_type, rel, fname
+
+    return None, None, None
+
+
+def _resolve_export_media_path(export_root: Path, relative_path: str) -> Path | None:
+    """Resolve an export media reference without allowing it to leave the export root."""
+    # SECURITY-REVIEW: Export paths are untrusted and must remain below export_root.
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+
+    normalized = relative_path.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", normalized):
+        return None
+
+    relative = PurePosixPath(normalized)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+
+    try:
+        root = export_root.resolve(strict=True)
+        candidate = root
+        for part in relative.parts:
+            candidate /= part
+            if candidate.is_symlink():
+                return None
+        resolved = candidate.resolve(strict=True)
+    except OSError, RuntimeError, ValueError:
+        return None
+
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _build_service_text(msg: dict) -> str:
+    """Build display text for service messages from action fields."""
+    action = msg.get("action", "")
+    actor = msg.get("actor", "") or msg.get("from", "")
+    text_parts = []
+
+    if actor:
+        text_parts.append(actor)
+
+    action_map = {
+        "pin_message": "pinned a message",
+        "phone_call": "made a phone call",
+        "create_group": "created the group",
+        "invite_members": "invited members",
+        "remove_members": "removed members",
+        "join_group_by_link": "joined the group via invite link",
+        "join_group_by_request": "joined the group via request",
+        "migrate_to_supergroup": "upgraded to supergroup",
+        "migrate_from_group": "migrated from group",
+        "edit_group_title": "changed the group title",
+        "edit_group_photo": "changed the group photo",
+        "delete_group_photo": "removed the group photo",
+        "score_in_game": "scored in a game",
+        "custom_action": msg.get("text", "performed an action"),
+    }
+
+    text_parts.append(action_map.get(action, action.replace("_", " ") if action else "performed an action"))
+
+    if msg.get("title"):
+        text_parts.append(f'"{msg["title"]}"')
+    if msg.get("members"):
+        names = [m if isinstance(m, str) else str(m) for m in msg["members"]]
+        text_parts.append(", ".join(names))
+
+    return " ".join(text_parts)
+
+
+# ---------------------------------------------------------------------------
+# HTML export parsing
+# ---------------------------------------------------------------------------
+
+
+# Real UTC offsets only (-12:00 .. +14:00): a malformed token like UTC+24:00
+# would make fromisoformat raise (losing the date entirely, worse than the old
+# naive fallback) and UTC+02:60 would be silently normalized to +03:00 —
+# anything unmatched degrades to the old behavior instead: offset dropped,
+# wall-clock kept naive.
+_HTML_DATE_OFFSET = re.compile(r"^UTC([+-](?:0\d|1[0-3]):[0-5]\d|[+-]14:00)$")
+
+
+def parse_html_date(date_str: str) -> str | None:
+    """Convert HTML export date title to ISO format string.
+
+    Input: 'DD.MM.YYYY HH:MM:SS' or 'DD.MM.YYYY HH:MM:SS UTC+HH:MM'
+    Output: ISO 8601 string like '2024-01-01T12:00:00' or '2024-01-01T12:00:00+02:00'
+
+    The title is the exporter's local wall-clock time; the UTC+HH:MM suffix is the
+    only record of the offset, so it must survive into the ISO string — parse_date
+    normalises aware strings to naive UTC, matching every capture path.
+    """
+    if not date_str:
+        return None
+    parts = date_str.strip().split()
+    if len(parts) < 2:
+        return None
+    offset = ""
+    if len(parts) >= 3:
+        match = _HTML_DATE_OFFSET.match(parts[2])
+        if match:
+            offset = match.group(1)
+    try:
+        day, month, year = parts[0].split(".")
+        return f"{year}-{month}-{day}T{parts[1]}{offset}"
+    except ValueError, IndexError:
+        return None
+
+
+def _resolve_export_control_file(export_root: Path, candidate: Path) -> Path | None:
+    """Return a regular export control file only when it is contained and not a symlink."""
+    # SECURITY-REVIEW: result.json/messages*.html are controlled by the export artifact.
+    if candidate.is_symlink():
+        return None
+    try:
+        root = export_root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError, RuntimeError, ValueError:
+        return None
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _find_html_files(path: Path) -> list[Path]:
+    """Find and sort HTML message files in export directory.
+
+    Returns sorted list: messages.html, messages2.html, messages3.html, ...
+    """
+    files: list[Path] = []
+    main = _resolve_export_control_file(path, path / "messages.html")
+    if main is not None:
+        files.append(main)
+
+    idx = 2
+    while True:
+        candidate = path / f"messages{idx}.html"
+        if not candidate.exists() and not candidate.is_symlink():
+            break
+        html_file = _resolve_export_control_file(path, candidate)
+        if html_file is None:
+            break
+        files.append(html_file)
+        idx += 1
+
+    return files
+
+
+def _parse_html_duration(text: str) -> int | None:
+    """Parse duration string like '1:30:00' or '00:30' into seconds."""
+    match = re.match(r"(\d+):(\d{2}):(\d{2})", text)
+    if match:
+        return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+    match = re.match(r"(\d+):(\d{2})", text)
+    if match:
+        return int(match.group(1)) * 60 + int(match.group(2))
+    return None
+
+
+def _extract_html_media_info(body_el, export_path: Path) -> dict[str, Any] | None:
+    """Extract media info from an HTML message body element.
+
+    Returns dict with keys compatible with the JSON export format
+    (photo, file, media_type, file_name, width, height, duration_seconds)
+    or None if no media found.
+    """
+    result: dict[str, Any] = {}
+
+    # Check for photo link (appears as a.photo_wrap directly in body or inside media_wrap)
+    photo_link = body_el.select_one("a.photo_wrap")
+    if photo_link:
+        href = photo_link.get("href", "")
+        if href and not href.startswith(("#", "http")):
+            result["photo"] = href
+            img = photo_link.select_one("img")
+            if img:
+                style = img.get("style", "")
+                w = re.search(r"width:\s*(\d+)", style)
+                h = re.search(r"height:\s*(\d+)", style)
+                if w:
+                    result["width"] = int(w.group(1))
+                if h:
+                    result["height"] = int(h.group(1))
+            return result
+
+    # Check for media_wrap container (used for video, audio, voice, documents, etc.)
+    media_wrap = body_el.select_one(".media_wrap")
+    if not media_wrap:
+        return None
+
+    media_el = media_wrap.select_one(".media")
+    if not media_el:
+        # Bare link in media_wrap (fallback)
+        link = media_wrap.select_one("a[href]")
+        if link:
+            href = link.get("href", "")
+            if href and not href.startswith(("#", "http")):
+                folder = href.split("/")[0] if "/" in href else ""
+                if folder in ("photos", "images"):
+                    result["photo"] = href
+                else:
+                    result["file"] = href
+                    result["media_type"] = HTML_FOLDER_MEDIA_TYPE.get(folder, "")
+                    result["file_name"] = Path(href).name
+                return result
+        return None
+
+    classes = set(media_el.get("class", []))
+
+    # Determine media type from CSS class
+    media_type = ""
+    is_photo = False
+    for css_class, m_type in HTML_CSS_MEDIA_TYPE.items():
+        if css_class in classes:
+            media_type = m_type
+            is_photo = css_class == "media_photo"
+            break
+
+    # Find the link to the actual file
+    link = media_el.select_one("a[href]")
+    if not link:
+        return None
+
+    href = link.get("href", "")
+    if not href or href.startswith(("#", "http")):
+        return None
+
+    if is_photo or media_type == "photo":
+        result["photo"] = href
+        img = media_el.select_one("img")
+        if img:
+            style = img.get("style", "")
+            w = re.search(r"width:\s*(\d+)", style)
+            h = re.search(r"height:\s*(\d+)", style)
+            if w:
+                result["width"] = int(w.group(1))
+            if h:
+                result["height"] = int(h.group(1))
+    else:
+        result["file"] = href
+        result["file_name"] = Path(href).name
+
+        # If CSS class didn't identify the type, infer from folder name
+        if not media_type:
+            folder = href.split("/")[0] if "/" in href else ""
+            media_type = HTML_FOLDER_MEDIA_TYPE.get(folder, "")
+
+        result["media_type"] = media_type
+
+    # Extract duration from description element (e.g. "00:30")
+    desc = media_el.select_one(".description")
+    if desc:
+        duration = _parse_html_duration(desc.get_text(strip=True))
+        if duration is not None:
+            result["duration_seconds"] = duration
+
+    return result
+
+
+def _parse_html_export(html_files: list[Path], export_path: Path) -> tuple[str, list[dict]]:
+    """Parse Telegram Desktop HTML export files into message dicts.
+
+    Reads messages.html (and messages2.html, etc.) and extracts messages
+    into the same dict format used by the JSON result.json parser.
+
+    Returns (chat_name, messages_list).
+    """
+    from bs4 import BeautifulSoup
+
+    chat_name = "Unknown"
+    messages: list[dict] = []
+    last_sender_name: str | None = None
+
+    for html_file in html_files:
+        logger.info(f"Parsing {html_file.name}...")
+        with open(html_file, encoding="utf-8") as f:
+            soup = BeautifulSoup(f.read(), "html.parser")
+
+        # Extract chat name from the first file's page header
+        if chat_name == "Unknown":
+            header = soup.select_one(".page_header .text.bold")
+            if not header:
+                header = soup.select_one(".page_header .content .text")
+            if header:
+                chat_name = header.get_text(strip=True)
+
+        for msg_div in soup.select("div.message"):
+            classes = set(msg_div.get("class", []))
+
+            # Extract message ID from id="message12345"
+            div_id = msg_div.get("id", "")
+            msg_id = None
+            if div_id.startswith("message"):
+                try:
+                    msg_id = int(div_id[len("message") :])
+                except ValueError:
+                    pass
+
+            if msg_id is None:
+                continue
+
+            is_service = "service" in classes
+            is_joined = "joined" in classes
+
+            # --- Service messages ---
+            if is_service:
+                body = msg_div.select_one(".body")
+                if not body:
+                    continue
+                text = body.get_text(" ", strip=True)
+
+                date_el = body.select_one(".date") or msg_div.select_one(".date")
+                date_str = date_el.get("title", "") if date_el else ""
+                date_iso = parse_html_date(date_str)
+
+                messages.append(
+                    {
+                        "id": msg_id,
+                        "type": "service",
+                        "date": date_iso,
+                        "text": text,
+                        "action": "custom_action",
+                    }
+                )
+                continue
+
+            # --- Regular / joined messages ---
+            body = msg_div.select_one(".body")
+            if not body:
+                continue
+
+            # Sender name (use recursive=False to avoid matching nested forwarded names)
+            from_name_el = body.find("div", class_="from_name", recursive=False)
+            if from_name_el:
+                sender_name = from_name_el.get_text(strip=True)
+                # Strip "via @BotName" suffix
+                via_idx = sender_name.find(" via @")
+                if via_idx > 0:
+                    sender_name = sender_name[:via_idx].strip()
+                last_sender_name = sender_name
+            elif is_joined:
+                sender_name = last_sender_name
+            else:
+                sender_name = last_sender_name
+
+            # Date from title attribute
+            date_el = body.select_one(".date")
+            date_str = date_el.get("title", "") if date_el else ""
+            date_iso = parse_html_date(date_str)
+
+            # Message text (convert <br> to newlines, use recursive=False to skip forwarded text)
+            text_el = body.find("div", class_="text", recursive=False)
+            text = ""
+            if text_el:
+                for br in text_el.find_all("br"):
+                    br.replace_with("\n")
+                text = text_el.get_text()
+
+            # Reply reference from href="#go_to_message12345"
+            reply_to_id = None
+            reply_el = body.select_one(".reply_to")
+            if reply_el:
+                reply_link = reply_el.select_one("a[href]")
+                if reply_link:
+                    href = reply_link.get("href", "")
+                    match = re.search(r"go_to_message(\d+)", href)
+                    if match:
+                        reply_to_id = int(match.group(1))
+
+            # Forwarded message source
+            forwarded_from = None
+            fwd_el = body.select_one(".forwarded")
+            if fwd_el:
+                fwd_name = fwd_el.select_one(".from_name")
+                if fwd_name:
+                    forwarded_from = fwd_name.get_text(strip=True)
+
+            msg_data: dict[str, Any] = {
+                "id": msg_id,
+                "type": "message",
+                "date": date_iso,
+                "from": sender_name or "",
+                "text": text,
+                "reply_to_message_id": reply_to_id,
+                "forwarded_from": forwarded_from,
+            }
+
+            # Extract media references
+            media_info = _extract_html_media_info(body, export_path)
+            if media_info:
+                msg_data.update(media_info)
+
+            messages.append(msg_data)
+
+    return chat_name, messages
+
+
+# ---------------------------------------------------------------------------
+# Streaming export parser (9t6.5.48)
+# ---------------------------------------------------------------------------
+#
+# ``json.load`` held the whole export in memory (roughly 4x the file size as
+# Python objects), so a large account export could OOM the container before a
+# single row was written. This parser walks result.json ONCE with ijson and
+# hands out one chat at a time: the chat's scalar metadata plus a bounded
+# iterator over exactly that chat's messages. Peak memory becomes one message
+# (plus one chat's metadata), not one export.
+
+_SCALAR_EVENTS = {"string", "number", "integer", "double", "boolean", "null"}
+
+
+def _export_fingerprint(path: Path) -> str:
+    """Identity of the export file a resume marker is valid against.
+
+    Size plus a hash of the first MiB: cheap on multi-GB files, and any
+    re-export (different date range, different account, edited file) changes
+    at least one of the two. A mismatch simply invalidates the marker — the
+    import then starts fresh with the normal already-imported guard active.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        digest.update(handle.read(1024 * 1024))
+    return f"{path.stat().st_size}:{digest.hexdigest()}"
+
+
+def _drain(iterator: Iterator[Any]) -> None:
+    for _ in iterator:
+        pass
+
+
+def _check_meta_identity(meta: dict[str, Any] | None, identity: tuple[Any, Any] | None) -> None:
+    """Hard-fail if a chat's id/type surfaced only AFTER its messages.
+
+    ``json.load`` made key order irrelevant; a forward-only stream derives
+    the chat id from the fields seen BEFORE the messages array. Telegram
+    Desktop writes id/type first, but if an export ever did not, the rows
+    would land under a wrong id — corruption, not a warning. The parser
+    keeps mutating the yielded meta dict as trailing fields arrive, so
+    comparing it to the snapshot taken at derivation time catches exactly
+    that case.
+    """
+    if meta is None:
+        return
+    if (meta.get("id"), meta.get("type")) != identity:
+        raise ValueError(
+            "Chat id/type appeared after the chat's messages in the export — refusing to continue "
+            "because rows would be written under the wrong chat. Re-export the data or report this."
+        )
+
+
+def _bounded_messages(events, msgs_prefix: str):
+    """One chat's messages as a sub-stream of the shared event iterator.
+
+    Re-yields events until the ``end_array`` that closes exactly this chat's
+    ``messages`` array — nested arrays inside a message (``text_entities``)
+    carry longer prefixes, so they can never terminate it early — and feeds
+    them into ``ijson.items``, which builds one message dict at a time.
+    """
+
+    def bounded():
+        for event in events:
+            if event[0] == msgs_prefix and event[1] == "end_array":
+                return
+            yield event
+
+    return ijson.items(bounded(), msgs_prefix + ".item")
+
+
+def _stream_full_export_chats(events):
+    """Yield ``(meta, messages_iter)`` per chat of a full-account export.
+
+    ``meta`` is built from the chat's own fields via ``ObjectBuilder``; when
+    the ``messages`` key arrives the same event stream is handed to the
+    bounded sub-iterator instead. The caller must finish (or abandon) the
+    messages iterator before asking for the next chat — the generator drains
+    any remainder itself so the shared stream position is always correct.
+    Fields that appear AFTER the messages array still land in the (already
+    yielded) meta dict — the caller re-checks identity fields afterwards.
+    """
+    root = "chats.list.item"
+    msgs_prefix = root + ".messages"
+    builder = None
+    for prefix, event, value in events:
+        if builder is None:
+            if prefix == root and event == "start_map":
+                builder = ijson.ObjectBuilder()
+                builder.event(event, value)
+            elif prefix == "chats.list" and event == "end_array":
+                return
+        elif prefix == root and event == "map_key" and value == "messages":
+            next(events, None)  # consume (msgs_prefix, 'start_array', None)
+            messages = _bounded_messages(events, msgs_prefix)
+            yield builder.value, messages
+            _drain(messages)
+        elif prefix == root and event == "end_map":
+            builder = None
+        else:
+            builder.event(event, value)
+
+
+def _stream_export(fileobj):
+    """Walk either export shape once; yield ``("owner", id, None)`` at most
+    once, then ``("chat", meta, messages_iter)`` per chat.
+
+    Single-chat exports (top-level ``messages``) yield exactly one chat whose
+    meta holds the top-level scalars seen before the array; scalars after the
+    array still mutate that meta in place (checked by the caller). Full
+    exports read ``personal_information`` when it precedes ``chats`` — the
+    order Telegram Desktop writes — and warn once when it does not, matching
+    the old behavior for an export that lacks it entirely.
+    """
+    events = ijson.parse(fileobj, use_float=True)
+    meta: dict[str, Any] = {}
+    top_key: str | None = None
+    owner_builder = None
+    owner_seen = False
+    for prefix, event, value in events:
+        if owner_builder is not None:
+            owner_builder.event(event, value)
+            if prefix == "personal_information" and event == "end_map":
+                info = owner_builder.value
+                owner_builder = None
+                owner_seen = True
+                if isinstance(info, dict) and info.get("user_id") is not None:
+                    yield "owner", info.get("user_id"), None
+            continue
+        if prefix == "" and event == "map_key":
+            top_key = value
+            if value == "chats":
+                if not owner_seen:
+                    logger.warning(
+                        "personal_information not seen before chats — messages will carry no is_outgoing flag"
+                    )
+                yield from (("chat", m, it) for m, it in _stream_full_export_chats(events))
+                return
+            if value == "messages":
+                next(events, None)  # consume ('messages', 'start_array', None)
+                messages = _bounded_messages(events, "messages")
+                yield "chat", meta, messages
+                _drain(messages)
+                # Trailing top-level scalars (id/type after the array) still
+                # belong to this chat's meta; the caller re-checks identity.
+        elif prefix == "personal_information" and event == "start_map":
+            owner_builder = ijson.ObjectBuilder()
+            owner_builder.event(event, value)
+        elif prefix == top_key and event in _SCALAR_EVENTS:
+            meta[top_key] = value
+
+
+# ---------------------------------------------------------------------------
+# Main importer
+# ---------------------------------------------------------------------------
+
+
+class TelegramImporter:
+    """Import Telegram Desktop exports into Telegram-Archive database."""
+
+    def __init__(self, db: DatabaseAdapter, media_path: str, max_filename_bytes: int = 143, *, account_id: int):
+        self.db = db
+        # accounts.id every row written by this import belongs to.
+        self.account_id = account_id
+        self.media_path = media_path
+        self.media_root = Path(media_path).resolve()
+        self.max_filename_bytes = max_filename_bytes
+        # Owner of a full-account JSON export (personal_information.user_id);
+        # None for HTML and chat-scoped exports, which cannot know it.
+        self._owner_user_id: int | None = None
+
+    @classmethod
+    async def create(cls, media_path: str, max_filename_bytes: int = 143) -> TelegramImporter:
+        await init_database()
+        db = await get_adapter()
+        # Single-account stage: imports land under the migration-seeded account.
+        # Phase 5 replaces the constant with real per-account resolution here.
+        return cls(db, media_path, max_filename_bytes, account_id=DEFAULT_ACCOUNT_ID)
+
+    async def close(self) -> None:
+        await close_database()
+
+    async def run(
+        self,
+        export_path: str,
+        chat_id_override: int | None = None,
+        dry_run: bool = False,
+        skip_media: bool = False,
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        """Run the import process.
+
+        Auto-detects JSON (result.json) or HTML (messages.html) export format.
+        Returns a summary dict with counts per chat.
+        """
+        path = Path(export_path).resolve()
+        result_file = _resolve_export_control_file(path, path / "result.json")
+        html_files = _find_html_files(path)
+
+        summary: dict[str, Any] = {
+            "chats_imported": 0,
+            "chats_skipped": 0,
+            "total_messages": 0,
+            "total_media": 0,
+            "details": [],
+        }
+
+        if result_file is not None:
+            logger.info(f"Reading {result_file}...")
+            await self._run_json_streaming(
+                result_file=result_file,
+                export_root=path,
+                chat_id_override=chat_id_override,
+                dry_run=dry_run,
+                skip_media=skip_media,
+                merge=merge,
+                summary=summary,
+            )
+        elif html_files:
+            logger.info(f"Detected HTML export format ({len(html_files)} file(s))")
+            if not chat_id_override:
+                raise ValueError(
+                    "HTML exports (per-chat) don't include a chat ID. "
+                    "Please provide --chat-id (-c) with the Telegram chat ID "
+                    "(e.g., -c 123456789 for a private chat, -c -1001234567890 for a supergroup)."
+                )
+            chat_name, messages = _parse_html_export(html_files, path)
+            result = await self._import_chat(
+                chat_data={"name": chat_name, "type": "html_export", "id": 0},
+                chat_id=chat_id_override,
+                messages=messages,
+                total=len(messages),
+                export_path=path,
+                dry_run=dry_run,
+                skip_media=skip_media,
+                merge=merge,
+            )
+            summary["chats_imported"] += 1
+            summary["total_messages"] += result["messages"]
+            summary["total_media"] += result["media"]
+            summary["details"].append(result)
+        else:
+            raise FileNotFoundError(
+                f"No result.json or messages.html found in {path}. Expected a Telegram Desktop export directory."
+            )
+
+        return summary
+
+    async def _run_json_streaming(
+        self,
+        result_file: Path,
+        export_root: Path,
+        chat_id_override: int | None,
+        dry_run: bool,
+        skip_media: bool,
+        merge: bool,
+        summary: dict[str, Any],
+    ) -> None:
+        """Stream result.json chat by chat, resuming an interrupted import.
+
+        Resume model: every write the importer performs is an idempotent
+        upsert, so the recovery unit is the CHAT — completed chats are
+        recorded in a metadata marker (keyed to this export's fingerprint)
+        and skipped, the chat the previous run was inside is REPLAYED from
+        its start (an exact replay performs zero message writes), and
+        ``sync_status`` only ever runs at chat completion, so its counters
+        end up identical to an uninterrupted import. A finished import
+        clears the marker.
+        """
+        marker_key = account_metadata_key("import_progress", self.account_id)
+        fingerprint = _export_fingerprint(result_file)
+        completed: set[int] = set()
+        started_chat: int | None = None
+        resume_matched = False
+        if not dry_run:
+            marker = await self._load_import_marker(marker_key)
+            if marker and marker.get("fingerprint") == fingerprint:
+                completed = {int(c) for c in marker.get("completed", [])}
+                started_chat = marker.get("started")
+                resume_matched = True
+                if completed or started_chat is not None:
+                    logger.info(f"Resuming interrupted import: {len(completed)} chat(s) already complete")
+
+        any_chat_seen = False
+        prev_meta: dict[str, Any] | None = None
+        prev_identity: tuple[Any, Any] | None = None
+
+        with open(result_file, "rb") as handle:
+            stream = _stream_export(handle)
+            try:
+                for item in stream:
+                    if item[0] == "owner":
+                        # A full-account export names its owner: with it, every
+                        # message can carry an honest is_outgoing instead of
+                        # leaving the column NULL for the viewer fallback.
+                        try:
+                            self._owner_user_id = int(item[1] or 0) or None
+                        except TypeError, ValueError:
+                            self._owner_user_id = None
+                        continue
+                    _, chat_meta, messages = item
+                    # The PREVIOUS chat's meta may only now be complete (fields
+                    # after the messages array mutate it in place) — its
+                    # identity must not have changed under us.
+                    _check_meta_identity(prev_meta, prev_identity)
+                    any_chat_seen = True
+                    chat_id = (
+                        chat_id_override
+                        if chat_id_override
+                        else derive_chat_id(chat_meta.get("id", 0), chat_meta.get("type", "personal_chat"))
+                    )
+                    prev_meta = chat_meta
+                    prev_identity = (chat_meta.get("id"), chat_meta.get("type"))
+
+                    if chat_id == 0:
+                        logger.warning("Skipping a chat entry with no ID")
+                        continue
+                    if chat_id in completed:
+                        summary["chats_skipped"] += 1
+                        continue
+
+                    resuming = resume_matched and started_chat == chat_id
+                    if not dry_run:
+                        started_chat = chat_id
+                        await self._save_import_marker(marker_key, fingerprint, completed, chat_id)
+
+                    result = await self._import_chat(
+                        chat_data=chat_meta,
+                        chat_id=chat_id,
+                        messages=messages,
+                        total=None,
+                        export_path=export_root,
+                        dry_run=dry_run,
+                        skip_media=skip_media,
+                        merge=merge,
+                        resuming=resuming,
+                    )
+
+                    summary["chats_imported"] += 1
+                    summary["total_messages"] += result["messages"]
+                    summary["total_media"] += result["media"]
+                    summary["details"].append(result)
+
+                    if not dry_run:
+                        completed.add(chat_id)
+                        await self._save_import_marker(marker_key, fingerprint, completed, None)
+
+                    if chat_id_override:
+                        if next(stream, None) is not None:
+                            logger.info("--chat-id provided with multi-chat export; only importing first chat")
+                        break
+            except ijson.JSONError as exc:
+                # Progress up to the last completed chat is already in the
+                # marker, so fixing the file and re-running resumes there.
+                raise ValueError(
+                    f"Export file is truncated or invalid JSON ({type(exc).__name__}) — "
+                    "already-completed chats are saved; re-run the import to resume after fixing the file"
+                ) from exc
+        _check_meta_identity(prev_meta, prev_identity)
+
+        if not any_chat_seen:
+            raise ValueError("No chats found in export file")
+
+        if not dry_run:
+            # Clean completion: clear the marker so an unrelated future import
+            # of a DIFFERENT export never inherits this one's skip set.
+            await self.db.set_metadata(marker_key, "")
+
+    async def _load_import_marker(self, marker_key: str) -> dict[str, Any] | None:
+        raw = await self.db.get_metadata(marker_key)
+        if not raw:
+            return None
+        try:
+            marker = json.loads(raw)
+        except TypeError, ValueError:
+            return None
+        return marker if isinstance(marker, dict) else None
+
+    async def _save_import_marker(
+        self, marker_key: str, fingerprint: str, completed: set[int], started: int | None
+    ) -> None:
+        await self.db.set_metadata(
+            marker_key,
+            json.dumps({"fingerprint": fingerprint, "completed": sorted(completed), "started": started}),
+        )
+
+    def _extract_chats(self, data: dict) -> list[dict]:
+        """Extract chat list from either single-chat or full-account export."""
+        if "messages" in data:
+            return [data]
+        if "chats" in data and isinstance(data["chats"], dict):
+            chat_list = data["chats"].get("list", [])
+            if isinstance(chat_list, list):
+                return chat_list
+        return []
+
+    async def _import_chat(
+        self,
+        chat_data: dict,
+        chat_id: int,
+        messages: Iterator[dict] | list[dict],
+        total: int | None,
+        export_path: Path,
+        dry_run: bool,
+        skip_media: bool,
+        merge: bool,
+        resuming: bool = False,
+    ) -> dict[str, Any]:
+        """Import a single chat; ``messages`` may be a one-pass stream.
+
+        ``total`` is known only for materialized inputs (HTML); ``resuming``
+        marks the chat a previous interrupted run was inside — its partial
+        rows are the importer's own output, so the already-imported guard
+        must not fire and the replay converges through the upserts.
+        """
+        chat_name = chat_data.get("name", "Unknown")
+        export_type = chat_data.get("type", "personal_chat")
+
+        if total is None:
+            logger.info(f"Importing chat (type: {export_type})")
+        else:
+            logger.info(f"Importing chat (type: {export_type}) - {total} messages")
+
+        if not merge and not dry_run and not resuming:
+            existing = await self.db.get_chat_stats(chat_id, account_id=self.account_id)
+            if existing and existing.get("messages", 0) > 0:
+                raise ValueError(
+                    f"Chat {chat_id} ('{chat_name}') already has {existing['messages']} messages. "
+                    "Use --merge to import into an existing chat."
+                )
+
+        if not dry_run:
+            # Only observations the export actually made may reach the row:
+            # upsert_chat updates exactly the keys present, so an absent key
+            # preserves whatever capture already recorded. Supplying
+            # type='unknown' / first_name=None here rewrote captured private
+            # chats and NULLed the contact's real name on --merge.
+            chat_row: dict[str, Any] = {"id": chat_id}
+            if export_type == "html_export":
+                # An HTML export names the chat but cannot say what KIND it
+                # is, nor whether that name is a person's first name. The
+                # name is still worth keeping when no row exists yet.
+                if await self.db.get_chat_by_id(chat_id, account_id=self.account_id) is None:
+                    chat_row["title"] = chat_name
+            elif export_type in ("personal_chat", "bot_chat"):
+                chat_row["type"] = CHAT_TYPE_MAP[export_type]
+                chat_row["first_name"] = chat_name
+            else:
+                chat_row["type"] = CHAT_TYPE_MAP.get(export_type, "unknown")
+                chat_row["title"] = chat_name
+            await self.db.upsert_chat(chat_row, account_id=self.account_id)
+
+        seen_users: set[int] = set()
+        msg_count = 0
+        media_count = 0
+        max_msg_id = 0
+        min_msg_id = 0
+        batch: list[dict[str, Any]] = []
+        media_batch: list[dict[str, Any]] = []
+
+        for msg in messages:
+            msg_id = msg.get("id")
+            if msg_id is None:
+                continue
+
+            msg_type = msg.get("type", "message")
+
+            if msg_type == "service":
+                sender_name = _clean_sender_name(msg.get("actor")) or _clean_sender_name(msg.get("from"))
+                sender_id = parse_from_id(msg.get("actor_id") or msg.get("from_id"))
+            else:
+                sender_name = _clean_sender_name(msg.get("from"))
+                sender_id = parse_from_id(msg.get("from_id"))
+
+            if sender_id and sender_id > 0 and sender_id not in seen_users and not dry_run:
+                seen_users.add(sender_id)
+                await self.db.upsert_user(
+                    {
+                        "id": sender_id,
+                        "first_name": sender_name or "",
+                    }
+                )
+
+            if msg_type == "service":
+                text = _build_service_text(msg)
+            else:
+                text = flatten_text(msg.get("text"))
+
+            date = parse_date(msg)
+            if date is None:
+                logger.warning(f"Skipping message {msg_id}: no valid date")
+                continue
+
+            # Cursor bounds track only messages actually accepted for insert: a
+            # skipped message must never advance the sweep cursor past itself.
+            max_msg_id = max(max_msg_id, msg_id)
+            min_msg_id = msg_id if min_msg_id == 0 else min(min_msg_id, msg_id)
+
+            raw_data: dict[str, Any] = {}
+            if msg.get("forwarded_from"):
+                raw_data["forward_from_name"] = msg["forwarded_from"]
+
+            # Telegram Desktop exports carry no outgoing flag, no pinned flag and
+            # no forwarder id (forwarded_from is a bare display name, kept in
+            # raw_data above). Supplying hard-coded stand-ins here made the
+            # upsert treat them as observations, so `import --merge` overwrote
+            # the captured is_outgoing/is_pinned/forward_from_id on every
+            # overlapping row. Absent keys instead: a fresh insert still gets the
+            # correct defaults from the adapter, and a merge leaves the archived
+            # values alone.
+            message_data = {
+                "id": msg_id,
+                "chat_id": chat_id,
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "date": date,
+                "text": text,
+                "reply_to_msg_id": msg.get("reply_to_message_id"),
+                "edit_date": parse_edited_date(msg),
+                "raw_data": raw_data,
+            }
+
+            if self._owner_user_id and sender_id is not None:
+                message_data["is_outgoing"] = 1 if sender_id == self._owner_user_id else 0
+
+            batch.append(message_data)
+            msg_count += 1
+
+            if not skip_media:
+                media_type, rel_path, orig_name = _detect_media(msg)
+                if media_type and rel_path:
+                    source = _resolve_export_media_path(export_path, rel_path)
+                    if source is not None:
+                        media_data = None
+                        try:
+                            media_id = f"import_{chat_id}_{msg_id}"
+                            dest_dir = (self.media_root / str(chat_id)).resolve()
+                            original_name = orig_name or Path(rel_path.replace("\\", "/")).name
+                            dest_name = build_media_filename(media_id, original_name, self.max_filename_bytes)
+                            dest_file = dest_dir / dest_name
+                            resolved_dest = dest_file.resolve()
+                            if not resolved_dest.is_relative_to(self.media_root):
+                                logger.warning("Skipping imported media with an unsafe destination")
+                            else:
+                                file_size = source.stat().st_size
+                                stored_path = f"{chat_id}/{dest_name}"
+                                media_data = {
+                                    "id": media_id,
+                                    "message_id": msg_id,
+                                    "chat_id": chat_id,
+                                    "type": media_type,
+                                    "file_name": dest_name,
+                                    "file_path": stored_path,
+                                    "file_size": file_size,
+                                    "mime_type": msg.get("mime_type"),
+                                    "width": msg.get("width"),
+                                    "height": msg.get("height"),
+                                    "duration": msg.get("duration_seconds"),
+                                    "downloaded": True,
+                                    "download_date": utcnow_naive(),
+                                    "_source": str(source),
+                                    "_dest": str(resolved_dest),
+                                }
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            logger.warning(
+                                "Skipping imported media after an invalid path or filesystem error (%s)",
+                                type(exc).__name__,
+                            )
+                        if media_data is not None:
+                            media_batch.append(media_data)
+                            if dry_run:
+                                media_count += 1
+                    else:
+                        logger.warning("Skipping imported media outside the export root or missing from the export")
+
+            if len(batch) >= BATCH_SIZE:
+                if not dry_run:
+                    media_count += await self._flush_batch(batch, media_batch)
+                batch.clear()
+                media_batch.clear()
+                denominator = f"/{total}" if total is not None else ""
+                logger.info(f"  Progress: {msg_count}{denominator} messages")
+
+        if batch and not dry_run:
+            media_count += await self._flush_batch(batch, media_batch)
+
+        if not dry_run and msg_count > 0:
+            # Advance the sweep cursor only when the export demonstrably covers
+            # the chat's head (Telegram ids start at 1). Desktop's exporter
+            # offers date ranges, so a partial export must not raise the
+            # cursor: every id below its maximum would be treated as already
+            # captured and the still-retrievable older history silently never
+            # fetched. Gap-fill cannot recover a missing head — it only sees
+            # holes BETWEEN stored rows — so this guard is the only protection.
+            # An existing higher cursor is never lowered either (merge case).
+            if min_msg_id > 1:
+                logger.warning(
+                    f"Export starts at message id {min_msg_id}, not the chat head - "
+                    "sweep cursor left unchanged so the next backup run can still fetch the older history"
+                )
+            else:
+                current = await self.db.get_last_message_id(chat_id, account_id=self.account_id)
+                if max_msg_id > (current or 0):
+                    await self.db.update_sync_status(chat_id, max_msg_id, msg_count, account_id=self.account_id)
+
+        action = "Would import" if dry_run else "Imported"
+        logger.info(f"{action} {msg_count} messages and {media_count} media files")
+
+        return {
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "messages": msg_count,
+            "media": media_count,
+            "max_message_id": max_msg_id,
+        }
+
+    async def _flush_batch(
+        self,
+        messages: list[dict[str, Any]],
+        media: list[dict[str, Any]],
+    ) -> int:
+        """Flush a batch of messages and media to the database."""
+        await self.db.insert_messages_batch(messages, account_id=self.account_id)
+        copied = 0
+
+        for m in media:
+            source = m.pop("_source")
+            dest = m.pop("_dest")
+
+            # The sweep may already have archived this message's media under
+            # its own id — including by ADOPTING an earlier run's import row
+            # (#405 re-keys it). Re-creating the import row would resurrect
+            # the duplicate adoption exists to prevent, so any other media
+            # row for the message wins and this one stands aside.
+            if await self.db.has_media_for_message(
+                m["chat_id"], m["message_id"], exclude_id=m["id"], account_id=self.account_id
+            ):
+                continue
+
+            dest_path = Path(dest)
+            # SECURITY-REVIEW: Re-check the untrusted import destination before filesystem writes.
+            try:
+                resolved_parent = dest_path.parent.resolve()
+                if not resolved_parent.is_relative_to(self.media_root) or dest_path.is_symlink():
+                    logger.warning("Skipping imported media with an unsafe destination")
+                    continue
+                resolved_parent.mkdir(parents=True, exist_ok=True)
+                if not dest_path.exists():
+                    await asyncio.to_thread(shutil.copy2, source, dest_path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("Skipping imported media after a filesystem error (%s)", type(exc).__name__)
+                continue
+
+            await self.db.insert_media(m, account_id=self.account_id)
+            copied += 1
+
+        return copied

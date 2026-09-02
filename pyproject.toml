@@ -1,0 +1,148 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-archive"
+version = "8.5.0"
+description = "Automated Telegram backup with Docker. Performs incremental backups of messages and media on a configurable schedule."
+readme = "README.md"
+requires-python = ">=3.14"
+license = {text = "GPL-3.0-or-later"}
+authors = [
+    {name = "Sergio Fernández", email = "sergio@geiser.cloud"}
+]
+keywords = ["telegram", "backup", "archive", "docker", "telethon"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Chat",
+    "Topic :: System :: Archiving :: Backup",
+]
+
+dependencies = [
+    "telethon>=1.37.0",
+    "python-socks[asyncio]>=2.7.1",
+    "APScheduler>=3.10.4",
+    "python-dotenv>=1.0.1",
+    "cryptg>=0.4.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "jinja2>=3.1.4",
+    "httpx>=0.28.1",
+    "websockets>=12.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
+    "psycopg2-binary>=2.9.9",
+    "alembic>=1.14.0",
+    "greenlet>=3.1.0",
+    "beautifulsoup4>=4.12.0",
+    "ijson>=3.5.1",
+    "pywebpush>=2.3.0",
+    "py-vapid>=1.9.4",
+    "cryptography>=50.0.0",
+    "Pillow>=12.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # 9.0 for the built-in `subtests` fixture the equivalence matrices use;
+    # on 7.x/8.x those tests fail at collection rather than run.
+    "pytest>=9.0",
+    "pytest-asyncio>=0.26.0",
+    "pytest-cov>=7.1.0",
+    "ruff==0.16.4",
+    "pre-commit>=4.5.1",
+]
+
+[dependency-groups]
+# Standalone runtime set for the viewer image: Dockerfile.viewer installs ONLY
+# this group, so the internet-facing container carries no telethon, cryptg,
+# psycopg2-binary or APScheduler it can never import. Every entry MUST mirror
+# the exact requirement string in [project] dependencies —
+# tests/test_viewer_dependency_group.py enforces the subset.
+viewer-runtime = [
+    "python-dotenv>=1.0.1",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "jinja2>=3.1.4",
+    "websockets>=12.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
+    "greenlet>=3.1.0",
+    "pywebpush>=2.3.0",
+    "py-vapid>=1.9.4",
+    "cryptography>=50.0.0",
+    "Pillow>=12.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/GeiserX/Telegram-Archive"
+Repository = "https://github.com/GeiserX/Telegram-Archive"
+Issues = "https://github.com/GeiserX/Telegram-Archive/issues"
+Changelog = "https://github.com/GeiserX/Telegram-Archive/blob/main/docs/CHANGELOG.md"
+
+[project.scripts]
+telegram-archive = "src.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+
+[tool.setuptools.package-data]
+src = ["web/templates/**/*", "web/static/**/*"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E711",   # none-comparison (SQLAlchemy uses == None idiom)
+    "E721",   # type-comparison (existing pattern)
+    "E722",   # bare-except (TODO: fix incrementally, widespread in codebase)
+    "B008",   # do not perform function calls in argument defaults (FastAPI depends on this)
+    "B904",   # raise-without-from-inside-except (TODO: fix incrementally)
+    "SIM102", # collapsible-if (readability preference, existing code)
+    "SIM103", # needless-bool (existing code patterns)
+    "SIM105", # suppressible-exception (existing code patterns)
+    "SIM108", # use ternary operator (readability preference)
+    "UP042",  # replace-str-enum (keep existing pattern for consistency)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts and migrations have less strict requirements
+"scripts/*" = ["F841", "B007"]
+# Argparse subparsers are assigned for side effects
+"src/__main__.py" = ["F841"]
+# Core backup has intentional variable assignments and zip patterns
+"src/telegram_backup.py" = ["F841", "B905"]
+# Test mocks are assigned for patching side effects
+"tests/*" = ["F841"]
+# Alembic migrations use dialect variable for inspection
+"alembic/*" = ["F841"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

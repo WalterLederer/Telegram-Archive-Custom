@@ -1,0 +1,59 @@
+FROM python:3.14-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system libraries for Pillow + ffmpeg for video thumbnail extraction
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libwebp7 libwebpmux3 zlib1g \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv for fast, reproducible dependency installation
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /bin/uv
+
+# Install dependencies (locked versions)
+# --locked fails the build if uv.lock is out of date with pyproject.toml,
+# instead of silently shipping an image that is missing a declared dependency.
+COPY pyproject.toml uv.lock ./
+# Only the viewer's runtime group: the exposed image must not carry the
+# capture stack (telethon, cryptg, psycopg2-binary, APScheduler) it can
+# never import.
+RUN uv sync --locked --no-install-project --only-group viewer-runtime
+
+# Copy only the necessary application code for the viewer
+COPY src/__init__.py ./src/
+COPY src/config.py ./src/
+COPY src/realtime.py ./src/
+COPY src/message_utils.py ./src/
+COPY src/db/ ./src/db/
+COPY src/web/ ./src/web/
+COPY scripts/healthcheck_viewer.py ./scripts/healthcheck_viewer.py
+
+# Create non-root user for security
+RUN useradd -m -u 1000 telegram && \
+    mkdir -p /data/backups && \
+    chown -R telegram:telegram /app /data
+
+# Switch to non-root user
+USER telegram
+
+# Set default environment variables
+ENV BACKUP_PATH=/data/backups \
+    LOG_LEVEL=INFO \
+    PYTHONPATH=/app \
+    PATH="/app/.venv/bin:$PATH"
+
+# Volume for persistent data (read-only access to backups)
+VOLUME ["/data"]
+
+# Healthy means /api/health answers "ok" — "degraded" (database unreachable)
+# is unhealthy, because a viewer that cannot read the archive is not serving.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD ["python3", "/app/scripts/healthcheck_viewer.py"]
+
+# Expose web viewer port
+EXPOSE 8000
+
+# Run web viewer
+CMD ["uvicorn", "src.web.main:app", "--host", "0.0.0.0", "--port", "8000"]
