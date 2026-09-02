@@ -1,0 +1,37 @@
+name: Seed Telegram Archive v8.5.0
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seed-upstream.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import upstream v8.5.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v8.5.0 https://github.com/GeiserX/Telegram-Archive.git upstream
+          rsync -a --exclude='.git' upstream/ ./
+          rm -rf upstream
+          rm -f .github/workflows/seed-upstream.yml
+
+      - name: Commit upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Seed from Telegram-Archive v8.5.0'
+          git push origin HEAD:main
