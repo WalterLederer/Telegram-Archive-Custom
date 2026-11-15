@@ -1,3 +1,7 @@
+> **Notice:** This repository was created solely for pull requests and testing purposes. It is not intended for general use, and should not be used as an active or production repository. Please refer to the official repository for the maintained version.
+> 
+
+
 <p align="center">
   <img src="docs/images/banner.svg" alt="Telegram Archive — self-hosted Telegram backups" width="900"/>
 </p>
